@@ -11,6 +11,74 @@
       set_fact:
         test_id: "{{ 999999 | random }}"
 
+    - name: Wait for decode pod to be ready
+      shell: >-
+        echo "Checking for decode pod existence and readiness..." &&
+        timeout=300 &&
+        elapsed=0 &&
+        DECODE_POD="" &&
+        POD_STATUS="" &&
+        while [ $elapsed -lt $timeout ]; do
+          DECODE_POD=$(kubectl get pods -n "{{ llm_d_namespace }}" -l app.kubernetes.io/name=qwen-qwen3-0-6b-decode --no-headers 2>/dev/null | head -1 | cut -d' ' -f1 || echo "") &&
+          if [ -z "$DECODE_POD" ]; then
+            echo "No decode pod found by label, checking for any decode pod..." &&
+            DECODE_POD=$(kubectl get pods -n "{{ llm_d_namespace }}" --no-headers 2>/dev/null | grep decode | head -1 | cut -d' ' -f1 || echo "") ;
+          fi &&
+          if [ -n "$DECODE_POD" ]; then
+            POD_STATUS=$(kubectl get pod -n "{{ llm_d_namespace }}" "$DECODE_POD" --no-headers 2>/dev/null | tr -s ' ' | cut -d' ' -f3 || echo "Unknown") &&
+            echo "[STATUS] Pod Status Check: $DECODE_POD = $POD_STATUS" &&
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "[SUCCESS] Decode pod $DECODE_POD is running, moving to readiness check..." &&
+              break ;
+            else
+              echo "[WAITING] Pod not ready yet: $DECODE_POD status is $POD_STATUS (need Running)" ;
+            fi ;
+          else
+            echo "[NOT FOUND] Decode pod not found yet, waiting..." ;
+          fi &&
+          sleep 10 &&
+          elapsed=$((elapsed + 10)) ;
+        done &&
+        if [ -z "$DECODE_POD" ]; then
+          echo "Error: No decode pod found after timeout" &&
+          kubectl get pods -n "{{ llm_d_namespace }}" --no-headers | head -5 &&
+          exit 1 ;
+        fi &&
+        if [ "$POD_STATUS" != "Running" ]; then
+          echo "Error: Decode pod $DECODE_POD not running (status: $POD_STATUS)" &&
+          kubectl describe pod -n "{{ llm_d_namespace }}" "$DECODE_POD" | tail -10 &&
+          exit 1 ;
+        fi &&
+        echo "Decode pod $DECODE_POD is running. Now waiting for it to be ready..." &&
+        readiness_timeout=300 &&
+        elapsed=0 &&
+        while [ $elapsed -lt $readiness_timeout ]; do
+          echo "Checking logs for readiness indicator in pod $DECODE_POD..." &&
+          echo "=== Last 5 lines of decode pod logs ===" &&
+          kubectl logs -n "{{ llm_d_namespace }}" "$DECODE_POD" --tail=5 2>/dev/null || echo "Could not get logs" &&
+          echo "=======================================" &&
+          if [ "$(kubectl logs -n "{{ llm_d_namespace }}" "$DECODE_POD" 2>/dev/null | grep -c 'GET /metrics HTTP/1.1.*200 OK')" -ge 3 ]; then
+            echo "[SUCCESS] Found readiness indicator! Decode pod $DECODE_POD is ready!" &&
+            exit 0 ;
+          fi &&
+          echo "[WAITING] Readiness indicator not found yet. Waiting..." &&
+          sleep 10 &&
+          elapsed=$((elapsed + 10)) ;
+        done &&
+        echo "Timeout waiting for decode pod to be ready" &&
+        echo "Recent logs from decode pod:" &&
+        kubectl logs -n "{{ llm_d_namespace }}" "$DECODE_POD" --tail=20 2>/dev/null || echo "Could not get logs" &&
+        exit 1
+      register: decode_readiness
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: decode_readiness.rc != 0
+
+    - name: Display decode pod readiness check output
+      debug:
+        msg: "{{ decode_readiness.stdout_lines }}"
+      when: decode_readiness.stdout_lines is defined
+
     - name: Get gateway information
       shell: |
         kubectl get gateway -n {{ llm_d_namespace }} -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || \

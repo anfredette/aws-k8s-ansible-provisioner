@@ -1,14 +1,27 @@
 ---
-- name: Launch AWS GPU instance in US East 2
+- name: Launch AWS GPU instance
   hosts: localhost
   connection: local
   gather_facts: true
   vars:
-    aws_region: us-east-2
-    instance_type:  g6.4xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
-    ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
-    key_pair: router-team-us-east2
-    security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
+    instance_type: g6.4xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
+    
+    # Regions to try in order (us-east-1 first, then us-east-2)
+    regions_to_try:
+      - us-east-1
+      - us-east-2
+    
+    # Common configuration (same across regions where possible)
+    key_pair: router-team-us-east2  # Use common key pair name (must be created in each region)
+    
+    # Region-specific configurations (only what must be different)
+    region_configs:
+      us-east-1:
+        ami_id: ami-0e2c8caa4b6378d8c  # Ubuntu 22.04 with NVIDIA GPU driver
+        security_group_id: sg-076807475732436dd  # Copy of k8s security group from us-east-2
+      us-east-2:
+        ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
+        security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
     root_volume_size: 500  # GB
     instance_name: "{{ ansible_hostname }}-{{ ansible_date_time.epoch }}"
     
@@ -21,16 +34,20 @@
         state: present
       delegate_to: localhost
 
-    - name: Launch EC2 instance
+    - name: Initialize launch tracking
+      set_fact:
+        launch_successful: false
+
+    - name: Try launching instance in first preferred region
       amazon.aws.ec2_instance:
-        region: "{{ aws_region }}"
-        availability_zone: "{{ aws_region }}b"
+        region: "{{ regions_to_try[0] }}"
+        availability_zone: "{{ regions_to_try[0] }}b"
         name: "{{ instance_name }}"
-        image_id: "{{ ami_id }}"
+        image_id: "{{ region_configs[regions_to_try[0]].ami_id }}"
         instance_type: "{{ instance_type }}"
         key_name: "{{ key_pair }}"
         security_groups:
-          - "{{ security_group_id }}"
+          - "{{ region_configs[regions_to_try[0]].security_group_id }}"
         volumes:
           - device_name: /dev/sda1
             ebs:
@@ -45,10 +62,100 @@
           Name: "{{ instance_name }}"
           Environment: production
           InstanceType: "{{ instance_type }}"
-          AMI: "{{ ami_id }}"
+          AMI: "{{ region_configs[regions_to_try[0]].ami_id }}"
           CreatedBy: ansible
           CreatedAt: "{{ ansible_date_time.iso8601 }}"
-      register: ec2_instance
+          Region: "{{ regions_to_try[0] }}"
+      register: launch_attempt_0
+      ignore_errors: yes
+
+    - name: Set success if first region succeeded
+      set_fact:
+        launch_successful: true
+        ec2_instance: "{{ launch_attempt_0 }}"
+        aws_region: "{{ regions_to_try[0] }}"
+        ami_id: "{{ region_configs[regions_to_try[0]].ami_id }}"
+      when: 
+        - not launch_attempt_0.failed
+        - launch_attempt_0.instances is defined
+        - launch_attempt_0.instances | length > 0
+
+    - name: Try launching instance in second preferred region
+      amazon.aws.ec2_instance:
+        region: "{{ regions_to_try[1] }}"
+        availability_zone: "{{ regions_to_try[1] }}b"
+        name: "{{ instance_name }}"
+        image_id: "{{ region_configs[regions_to_try[1]].ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_pair }}"
+        security_groups:
+          - "{{ region_configs[regions_to_try[1]].security_group_id }}"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_type: gp3
+              volume_size: "{{ root_volume_size }}"
+              delete_on_termination: true
+              encrypted: true
+        state: running
+        wait: true
+        wait_timeout: 600
+        tags:
+          Name: "{{ instance_name }}"
+          Environment: production
+          InstanceType: "{{ instance_type }}"
+          AMI: "{{ region_configs[regions_to_try[1]].ami_id }}"
+          CreatedBy: ansible
+          CreatedAt: "{{ ansible_date_time.iso8601 }}"
+          Region: "{{ regions_to_try[1] }}"
+      register: launch_attempt_1
+      ignore_errors: yes
+      when: 
+        - not (launch_successful | default(false))
+        - regions_to_try | length > 1
+
+    - name: Set success if second region succeeded  
+      set_fact:
+        launch_successful: true
+        ec2_instance: "{{ launch_attempt_1 }}"
+        aws_region: "{{ regions_to_try[1] }}"
+        ami_id: "{{ region_configs[regions_to_try[1]].ami_id }}"
+      when: 
+        - not (launch_successful | default(false))
+        - regions_to_try | length > 1
+        - not launch_attempt_1.failed
+        - launch_attempt_1.instances is defined
+        - launch_attempt_1.instances | length > 0
+
+    - name: Display successful launch information
+      debug:
+        msg:
+          - "Successfully launched instance in region: {{ aws_region }}"
+          - "Instance ID: {{ ec2_instance.instances[0].instance_id }}"
+          - "AMI ID: {{ ami_id }}"
+          - "Key pair: {{ key_pair }}"
+          - "Security group: {{ region_configs[aws_region].security_group_id }}"
+      when: launch_successful
+
+    - name: Display failed regions
+      debug:
+        msg: "Failed to launch in region: {{ regions_to_try[0] }} - {{ launch_attempt_0.msg | default('Unknown error') }}"
+      when: 
+        - launch_attempt_0 is defined
+        - launch_attempt_0.failed
+
+    - name: Display failed second region
+      debug:
+        msg: "Failed to launch in region: {{ regions_to_try[1] }} - {{ launch_attempt_1.msg | default('Unknown error') }}"
+      when: 
+        - regions_to_try | length > 1
+        - launch_attempt_1 is defined
+        - launch_attempt_1.failed | default(false)
+
+    - name: Fail if all regions failed
+      fail:
+        msg: "Failed to launch instance in all attempted regions: {{ regions_to_try | join(', ') }}"
+      when: not (launch_successful | default(false))
 
     - name: Display instance information
       debug:
@@ -93,7 +200,7 @@
           Public IP: {{ ec2_instance.instances[0].public_ip_address | default('N/A') }}
           Private IP: {{ ec2_instance.instances[0].private_ip_address }}
           Key Pair: {{ key_pair }}
-          Security Group: {{ security_group_id }}
+          Security Group: {{ region_configs[aws_region].security_group_id }}
           Root Volume Size: {{ root_volume_size }}GB
           Launch Time: {{ ec2_instance.instances[0].launch_time }}
           
@@ -160,3 +267,4 @@
     - name: Display GPU information
       debug:
         msg: "GPU Information: {{ gpu_check.stdout if gpu_check.rc == 0 else 'No NVIDIA GPU detected' }}" 
+

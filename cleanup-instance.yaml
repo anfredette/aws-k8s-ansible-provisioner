@@ -4,7 +4,7 @@
   connection: local
   gather_facts: true
   vars:
-    aws_region: us-east-2
+    # No hardcoded region - will detect from instance details files
     
   tasks:
     - name: Ensure boto3 and botocore are installed
@@ -20,6 +20,26 @@
         paths: "."
         patterns: "gpu-inventory-*.ini"
       register: inventory_files
+
+    - name: Find instance details files
+      find:
+        paths: "."
+        patterns: "instance-*-details.txt"
+      register: details_files
+
+    - name: Extract instance info from details files
+      shell: |
+        for file in instance-*-details.txt; do
+          if [ -f "$file" ]; then
+            instance_id=$(grep "^Instance ID:" "$file" | cut -d' ' -f3)
+            region=$(grep "^Region:" "$file" | cut -d' ' -f2)
+            if [ -n "$instance_id" ] && [ -n "$region" ]; then
+              echo "${instance_id}:${region}"
+            fi
+          fi
+        done
+      register: details_instance_info
+      when: details_files.files | length > 0
 
     - name: Extract instance IDs from inventory files
       shell: |
@@ -43,33 +63,60 @@
       register: extracted_instance_ids
       when: inventory_files.files | length > 0
 
-    - name: Set instance IDs variable
+    - name: Build instance region mapping (prioritize details files)
       set_fact:
-        instance_ids: "{{ extracted_instance_ids.stdout_lines }}"
-      when: inventory_files.files | length > 0 and extracted_instance_ids.stdout_lines | length > 0
+        instances_by_region: >-
+          {%- set result = {} -%}
+          {%- set processed_instances = [] -%}
+          
+          {# First, process instances from details files (they have accurate region info) #}
+          {%- for item in details_instance_info.stdout_lines | default([]) -%}
+            {%- set parts = item.split(':') -%}
+            {%- set instance_id = parts[0] -%}
+            {%- set region = parts[1] if parts|length > 1 else 'us-east-2' -%}
+            {%- if region not in result -%}
+              {%- set _ = result.update({region: []}) -%}
+            {%- endif -%}
+            {%- if instance_id not in result[region] -%}
+              {%- set _ = result[region].append(instance_id) -%}
+              {%- set _ = processed_instances.append(instance_id) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          
+          {# Then, process instances from inventory files only if not already processed #}
+          {%- for instance_id in extracted_instance_ids.stdout_lines | default([]) -%}
+            {%- if instance_id not in processed_instances -%}
+              {%- set region = 'us-east-2' -%}
+              {%- if region not in result -%}
+                {%- set _ = result.update({region: []}) -%}
+              {%- endif -%}
+              {%- if instance_id not in result[region] -%}
+                {%- set _ = result[region].append(instance_id) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          
+          {{ result }}
+      when: (details_instance_info.stdout_lines | default([]) | length > 0) or (extracted_instance_ids.stdout_lines | default([]) | length > 0)
 
-    - name: Display found instance IDs
+    - name: Display instances grouped by region
       debug:
-        msg: "Found instance IDs from inventory files: {{ instance_ids }}"
-      when: instance_ids is defined and instance_ids | length > 0
+        msg: "Found instances by region: {{ instances_by_region }}"
+      when: instances_by_region is defined
 
-    - name: Get instance information
+    - name: Get instance information for each region
       amazon.aws.ec2_instance_info:
-        region: "{{ aws_region }}"
-        instance_ids: "{{ instance_ids }}"
-      register: instances_info
-      when: instance_ids is defined and instance_ids | length > 0
-
-    - name: Set instances to delete
-      set_fact:
-        instances_to_delete: "{{ instances_info.instances }}"
-      when: instances_info is defined and instances_info.instances is defined
+        region: "{{ item.key }}"
+        instance_ids: "{{ item.value }}"
+      register: all_instances_info
+      loop: "{{ instances_by_region | dict2items }}"
+      when: instances_by_region is defined
 
     - name: Display instances that will be deleted
       debug:
         msg: |
-          The following instances will be DELETED:
-          {% for instance in instances_to_delete %}
+          The following instances will be DELETED in region {{ item.item.key }}:
+          {% for instance in item.instances %}
           - Instance ID: {{ instance.instance_id }}
             Name: {{ instance.tags.Name | default('N/A') }}
             Type: {{ instance.instance_type }}
@@ -78,29 +125,30 @@
             Private IP: {{ instance.private_ip_address }}
             Launch Time: {{ instance.launch_time }}
           {% endfor %}
-      when: instances_to_delete is defined and instances_to_delete | length > 0
+      loop: "{{ all_instances_info.results }}"
+      when: all_instances_info is defined and all_instances_info.results is defined
 
     - name: Confirm no instances found
       debug:
-        msg: "No inventory files found. Nothing to cleanup."
-      when: inventory_files.files | length == 0
+        msg: "No inventory or details files found. Nothing to cleanup."
+      when: instances_by_region is not defined or instances_by_region | length == 0
 
-    - name: Terminate instances
+    - name: Terminate instances by region
       amazon.aws.ec2_instance:
-        region: "{{ aws_region }}"
+        region: "{{ item.0.item.key }}"
         instance_ids:
-          - "{{ item.instance_id }}"
+          - "{{ item.1.instance_id }}"
         state: terminated
         wait: true
         wait_timeout: 30
-      loop: "{{ instances_to_delete }}"
+      loop: "{{ all_instances_info.results | subelements('instances') }}"
       register: termination_results
-      when: instances_to_delete is defined and instances_to_delete | length > 0
+      when: all_instances_info is defined and all_instances_info.results is defined
 
     - name: Display termination results
       debug:
         msg: |
-          Instance {{ item.item.instance_id }} ({{ item.item.tags.Name | default('N/A') }}) 
+          Instance {{ item.item.1.instance_id }} ({{ item.item.1.tags.Name | default('N/A') }}) in region {{ item.item.0.item.key }}
           termination status: {{ item.changed | ternary('terminated', 'unchanged') }}
       loop: "{{ termination_results.results }}"
       when: termination_results is defined and termination_results.results is defined
@@ -110,14 +158,22 @@
         path: "{{ item.path }}"
         state: absent
       loop: "{{ inventory_files.files }}"
-      when: instances_to_delete is defined and instances_to_delete | length > 0
+      when: all_instances_info is defined and all_instances_info.results is defined
 
-    - name: Clean up instance details files
+    - name: Clean up instance details files (from AWS results)
       file:
-        path: "./instance-{{ item.instance_id }}-details.txt"
+        path: "./instance-{{ item.1.instance_id }}-details.txt"
         state: absent
-      loop: "{{ instances_to_delete }}"
-      when: instances_to_delete is defined and instances_to_delete | length > 0
+      loop: "{{ all_instances_info.results | subelements('instances') }}"
+      when: all_instances_info is defined and all_instances_info.results is defined
+      ignore_errors: yes
+
+    - name: Clean up instance details files (fallback - clean all found details files)
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ details_files.files }}"
+      when: details_files.files is defined and details_files.files | length > 0
       ignore_errors: yes
 
     - name: Clean up kubeconfig files
@@ -125,7 +181,7 @@
         paths: "."
         patterns: "kubeconfig-*"
       register: kubeconfig_files
-      when: instances_to_delete is defined and instances_to_delete | length > 0
+      when: all_instances_info is defined and all_instances_info.results is defined
 
     - name: Remove kubeconfig files
       file:
@@ -133,18 +189,30 @@
         state: absent
       loop: "{{ kubeconfig_files.files }}"
       when: 
-        - instances_to_delete is defined and instances_to_delete | length > 0
+        - all_instances_info is defined and all_instances_info.results is defined
         - kubeconfig_files.files is defined
       ignore_errors: yes
+
+    - name: Calculate total instances
+      set_fact:
+        total_instances: >-
+          {{
+            all_instances_info.results | map(attribute='instances') | map('length') | sum
+            if all_instances_info is defined and all_instances_info.results is defined
+            else 0
+          }}
 
     - name: Final cleanup summary
       debug:
         msg: |
           Cleanup completed!
-          {% if instances_to_delete is defined and instances_to_delete | length > 0 %}
-          Terminated {{ instances_to_delete | length }} instance(s):
-          {% for instance in instances_to_delete %}
+          {% if all_instances_info is defined and all_instances_info.results is defined %}
+          Terminated {{ total_instances }} instance(s) across {{ all_instances_info.results | length }} region(s):
+          {% for region_result in all_instances_info.results %}
+          Region {{ region_result.item.key }}:
+          {% for instance in region_result.instances %}
           - {{ instance.instance_id }} ({{ instance.tags.Name | default('N/A') }})
+          {% endfor %}
           {% endfor %}
           
           Cleaned up {{ inventory_files.files | length }} inventory file(s) and related files.

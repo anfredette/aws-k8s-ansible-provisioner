@@ -249,7 +249,7 @@
       
     - name: Create .kube directory for user
       file:
-        path: "{{ ansible_env.HOME }}/.kube"
+        path: "/home/{{ ansible_user }}/.kube"
         state: directory
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
@@ -267,7 +267,7 @@
     - name: Copy admin.conf to user's kube config
       copy:
         src: /etc/kubernetes/admin.conf
-        dest: "{{ ansible_env.HOME }}/.kube/config"
+        dest: "/home/{{ ansible_user }}/.kube/config"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: '0644'
@@ -282,6 +282,15 @@
         mode: '0644'
         remote_src: yes
       when: ansible_env.USER != ansible_user or ansible_user is undefined
+
+    - name: Add kubectl alias to user's .bashrc
+      lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: "alias k='kubectl'"
+        create: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
 
     - name: Wait for Kubernetes nodes to be ready
       shell: kubectl get nodes --request-timeout=10s

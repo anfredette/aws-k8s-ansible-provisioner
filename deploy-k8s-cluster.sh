@@ -39,6 +39,7 @@ deploy_cluster() {
 
     echo "Testing LLM-D..."
     ansible-playbook -i "$INVENTORY_FILE" llm-d-test.yaml
+    TEST_EXIT_CODE=$?
     
     echo "Deploying OpenTelemetry Observability Stack..."
     ansible-playbook -i "$INVENTORY_FILE" otel-observability-setup.yaml
@@ -71,19 +72,44 @@ deploy_cluster() {
     else
         echo "Warning: Could not find instance details file"
         echo "Check the instance details file for SSH access information."
-    fi 
+    fi
+
+    # Check if the test failed and provide helpful message
+    if [ "$TEST_EXIT_CODE" -ne 0 ]; then
+        echo ""
+        echo "⚠️  WARNING: The earlier LLM-D test failed."
+        echo "This is likely because not all pods were ready at the time."
+        echo "You can rerun the test when the system is ready with:"
+        echo ""
+        echo "    ./test-llm-d.sh"
+        echo ""
+        echo "Or manually with:"
+        echo "    ansible-playbook -i $INVENTORY_FILE llm-d-test.yaml"
+        echo ""
+    fi
 }
 
 cleanup_instances() {
     echo "=== Cleaning up AWS GPU instances ==="
 
-    # Check if there are any inventory files
-    if ! ls gpu-inventory-*.ini 1> /dev/null 2>&1; then
-        echo "No inventory files found. Nothing to cleanup."
+    # Check if there are any inventory or instance details files
+    has_inventory=false
+    has_details=false
+    
+    if ls gpu-inventory-*.ini 1> /dev/null 2>&1; then
+        has_inventory=true
+    fi
+    
+    if ls instance-*-details.txt 1> /dev/null 2>&1; then
+        has_details=true
+    fi
+    
+    if [ "$has_inventory" = false ] && [ "$has_details" = false ]; then
+        echo "No inventory or instance details files found. Nothing to cleanup."
         exit 0
     fi
 
-    echo "Found inventory files. Running cleanup playbook..."
+    echo "Found files to cleanup. Running cleanup playbook..."
     ansible-playbook cleanup-instance.yaml
 
     echo "Cleanup complete!"
