@@ -77,13 +77,24 @@ deploy_cluster() {
 cleanup_instances() {
     echo "=== Cleaning up AWS GPU instances ==="
 
-    # Check if there are any inventory files
-    if ! ls gpu-inventory-*.ini 1> /dev/null 2>&1; then
-        echo "No inventory files found. Nothing to cleanup."
+    # Check if there are any inventory or instance details files
+    has_inventory=false
+    has_details=false
+    
+    if ls gpu-inventory-*.ini 1> /dev/null 2>&1; then
+        has_inventory=true
+    fi
+    
+    if ls instance-*-details.txt 1> /dev/null 2>&1; then
+        has_details=true
+    fi
+    
+    if [ "$has_inventory" = false ] && [ "$has_details" = false ]; then
+        echo "No inventory or instance details files found. Nothing to cleanup."
         exit 0
     fi
 
-    echo "Found inventory files. Running cleanup playbook..."
+    echo "Found files to cleanup. Running cleanup playbook..."
     ansible-playbook cleanup-instance.yaml
 
     echo "Cleanup complete!"
