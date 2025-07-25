@@ -4,14 +4,12 @@
   connection: local
   gather_facts: true
   vars:
-    instance_type: g6.12xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
+    instance_type: g6.4xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
     
-    # Regions to try in order (us-east-2 first, then others)
+    # Regions to try in order (us-east-1 first, then us-east-2)
     regions_to_try:
-      - us-east-2
       - us-east-1
-      - us-west-2
-      - us-west-1
+      - us-east-2
     
     # Common configuration (same across regions where possible)
     key_pair: router-team-us-east2  # Use your existing working key
@@ -20,12 +18,10 @@
     region_configs:
       us-east-1:
         ami_id: ami-0e2c8caa4b6378d8c  # Ubuntu 22.04 with NVIDIA GPU driver
+        security_group_id: sg-076807475732436dd  # Copy of k8s security group from us-east-2
       us-east-2:
         ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
-      us-west-1:
-        ami_id: ami-0d53d72369335a9d6  # Ubuntu 22.04 with NVIDIA GPU driver
-      us-west-2:
-        ami_id: ami-05134c8ef96964280  # Ubuntu 22.04 with NVIDIA GPU driver
+        security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
     root_volume_size: 500  # GB
     instance_name: "{{ ansible_hostname }}-{{ ansible_date_time.epoch }}"
     
@@ -42,62 +38,8 @@
       set_fact:
         launch_successful: false
         
-    - name: Check if public key file exists
-      stat:
-        path: "~/.ssh/{{ key_pair }}.pub"
-      register: pub_key_file
-      delegate_to: localhost
 
-    - name: Display key file status
-      debug:
-        msg: "Public key file {{ '~/.ssh/' + key_pair + '.pub' }} {{ 'exists' if pub_key_file.stat.exists else 'does not exist' }}"
-
-    - name: Ensure key pair exists in each region
-      amazon.aws.ec2_key:
-        region: "{{ item }}"
-        name: "{{ key_pair }}"
-        key_material: "{{ lookup('file', '~/.ssh/' + key_pair + '.pub') }}"
-        state: present
-      register: key_pairs
-      loop: "{{ regions_to_try }}"
-      when: 
-        - not launch_successful
-        - pub_key_file.stat.exists
         
-    - name: Find or create security group for each region
-      amazon.aws.ec2_security_group:
-        region: "{{ item }}"
-        name: k8s-gpu-sg
-        description: Security group for Kubernetes GPU instances
-        rules:
-          - proto: tcp
-            ports:
-              - 22
-            cidr_ip: 0.0.0.0/0
-            rule_desc: SSH
-          - proto: tcp
-            ports:
-              - 6443
-            cidr_ip: 0.0.0.0/0
-            rule_desc: Kubernetes API server
-          - proto: tcp
-            ports:
-              - 10250
-            cidr_ip: 0.0.0.0/0
-            rule_desc: Kubelet API
-          - proto: tcp
-            ports:
-              - 30000-32767
-            cidr_ip: 0.0.0.0/0
-            rule_desc: NodePort Services
-        tags:
-          Name: k8s-gpu-security-group
-          Environment: production
-      register: security_groups
-      ignore_errors: yes
-      loop: "{{ regions_to_try }}"
-      when: not launch_successful
-
     - name: Try launching instance in each region until success
       amazon.aws.ec2_instance:
         region: "{{ item }}"
@@ -107,7 +49,7 @@
         instance_type: "{{ instance_type }}"
         key_name: "{{ key_pair }}"
         security_groups:
-          - k8s-gpu-sg
+          - "{{ region_configs[item].security_group_id }}"
         volumes:
           - device_name: /dev/sda1
             ebs:
@@ -151,7 +93,7 @@
           - "Instance ID: {{ ec2_instance.instances[0].instance_id }}"
           - "AMI ID: {{ ami_id }}"
           - "Key pair: {{ key_pair }}"
-          - "Security group: k8s-gpu-sg"
+          - "Security group: {{ region_configs[aws_region].security_group_id }}"
       when: launch_successful
       
     - name: Display failed regions
@@ -209,7 +151,7 @@
           Public IP: {{ ec2_instance.instances[0].public_ip_address | default('N/A') }}
           Private IP: {{ ec2_instance.instances[0].private_ip_address }}
           Key Pair: {{ key_pair }}
-          Security Group: k8s-gpu-sg
+          Security Group: {{ region_configs[aws_region].security_group_id }}
           Root Volume Size: {{ root_volume_size }}GB
           Launch Time: {{ ec2_instance.instances[0].launch_time }}
           
